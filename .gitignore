@@ -138,3 +138,6 @@ jjuke/modules/data/
 
 # Wandb
 wandb/
+
+# Datasets
+dataset/
