@@ -24,8 +24,9 @@ When you give students the assignment, note that:
 - remind students to fill in the code in the very cell, not the additional cell.
 
 # TODO
+
 There should be some supplementations to consider:
-[ ] sometimes some outputs are skipped even though the original code is correct
-[ ] how to grade visual results (plot, picture, ...)
-[ ] if there are any blank cells
-[ ] if there are any error cells (to skip)
+- [ ] sometimes some outputs are skipped even though the original code is correct
+- [ ] how to grade visual results (plot, picture, ...)
+- [ ] if there are any blank cells
+- [ ] if there are any error cells (to skip)
