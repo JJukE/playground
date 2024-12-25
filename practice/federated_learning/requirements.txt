@@ -1,0 +1,13 @@
+conda create -n dl_proj python=3.10 -y
+conda activate dl_proj
+conda install -c pytorch -c nvidia pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 -y
+conda install -c conda-forge matplotlib jupyterlab=3.6.5 ipykernel ipywidgets gpustat -y
+python -m ipykernel install --user --name dl_proj
+
+# pytorch3d
+conda install -c conda-forge -c iopath -c fvcore fvcore iopath -y
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@V0.7.8"
+
+# for data processing
+pip install librosa==0.9.2 wget==3.2 soundfile==0.10.3.post1
+pip install fire unidecode # for using jukebox
