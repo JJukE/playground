@@ -132,7 +132,7 @@ class Mamba(nn.Module):
         # Extra normalization layer right before output projection
         if self.rms_norm:
             assert RMSNormGated is not None
-            self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
+            self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=False, **factory_kwargs)
         
         if self.process_group is None:
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
@@ -490,7 +490,7 @@ class MambaMine(nn.Module):
         # Extra normalization layer right before output projection
         if self.rms_norm:
             assert RMSNormGated is not None
-            self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
+            self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=False, **factory_kwargs)
         
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
 
@@ -714,6 +714,176 @@ class MambaMine(nn.Module):
         return out
 
 
+class MambaMineSimple(nn.Module):
+    """ My version of Mamba2 code from https://github.com/state-spaces/mamba.
+    No device & dtype, conv_init, D_has_hdim, learnable_init_states, and inference_params.
+    """
+    def __init__(
+        self,
+        dim_model: int,
+        dim_state: int = 128,
+        dim_conv: int = 4,
+        expand: int = 2,
+        dim_head: int = 64,
+        dim_ssd: int = None, # if not None, we only apply SSM on this many dimensions, the rest uses gated MLP
+        num_group: int = 1,
+        A_init_range: tuple = (1, 16),
+        dt_init_floor: float = 1.0e-4,
+        dt_limit: tuple = (0., float("inf")),
+        chunk_size: int = 256,
+        use_mem_eff_path: bool = True,
+        layer_idx = None, # absorb kwarg for general module
+        rms_norm=True,
+        activation: str = "swish",
+    ) -> None:
+        super().__init__()
+        
+        self.dim_model = dim_model
+        self.dim_state = dim_state
+        self.dim_conv = dim_conv
+        self.dim_inner = expand * self.dim_model
+        self.dim_head = dim_head
+        self.dim_ssd = self.dim_inner if dim_ssd is None else dim_ssd
+        self.num_group = num_group
+        assert self.dim_inner == expand * self.dim_model
+        assert self.dim_ssd % self.dim_head == 0
+        self.num_head = self.dim_ssd // self.dim_head # num_head is 8 for original model
+        self.dt_limit = dt_limit
+        self.chunk_size = chunk_size
+        self.use_mem_eff_path = use_mem_eff_path
+        self.layer_idx = layer_idx
+        self.rms_norm = rms_norm
+        self.activation = activation
+        
+        # Order: [z, x, B, C, dt]
+        d_in_proj = 2 * self.dim_inner + 2 * self.num_group * self.dim_state + self.num_head
+        self.in_proj = nn.Linear(self.dim_model, d_in_proj, bias=False)
+        
+        conv_dim = self.dim_ssd + 2 * self.num_group * self.dim_state # x, B, C
+        self.conv1d = nn.Conv1d(conv_dim, conv_dim, dim_conv, bias=True, groups=conv_dim, padding=dim_conv-1)
+        
+        # initialize log dt bias
+        dt_min, dt_max = 0.001, 0.1
+        dt = torch.exp(torch.rand(self.num_head) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        dt = torch.clamp(dt, min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt)) # inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True # just to be explicit (it's already True)
+        
+        # A parameter
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        A = torch.empty(self.num_head).uniform_(*A_init_range)
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        # self.register_buffer("A_log", torch.zeros(self.num_head, dtype=torch.float32, device=device), persistent=True)
+        self.A_log._no_weight_decay = True
+        
+        # D "skip" parameter
+        self.D = nn.Parameter(torch.ones(self.num_head))
+        self.D._no_weight_decay = True
+
+        # extra normalization layer right before output projection
+        if self.rms_norm:
+            self.norm = RMSNormGated(self.dim_ssd, eps=1.0e-5, norm_before_gate=False)
+        
+        self.out_proj = nn.Linear(self.dim_inner, self.dim_model, bias=False)
+    
+    
+    def forward(self, u, seq_len=None, seq_idx=None, cu_seqlens=None):
+        """
+        Args:
+            u: (batch, seq_len, hidden_dim) if seq_len == None. If seq_len is not None, u is
+               (batch*seq_len, hidden_dim). This is so that when we split u during sequence parallel,
+               we split the batch*seq_len dimension (in case batch is small).
+            memory: (batch, mem_seq_len, mem_hidden_dim) tokens for cross-attention
+            t: (batch, t_hidden_dim) tokens for FiLM containing timestep embedding.
+            seq_len, seq_idx, cu_seqlens: arguments for processing variable length input.
+        Returns:
+            same shape as u
+        """
+        # TODO: maybe assign specific dtype for some parameters
+        seqlen_orig = seq_len
+        if seq_len is None:
+            batch, seqlen, dim = u.shape
+        else:
+            batch_seqlen, dim = u.shape
+            batch = batch_seqlen // seq_len
+
+        zxbcdt = self.in_proj(u) # (B, L, d_in_proj) or (B*L, d_in_proj)
+        if seqlen_orig is not None:
+            zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
+        # NOTE: If the model is loaded in fp16, without the .float() here, A might be -inf
+        A = -torch.exp(self.A_log.float()) # (num_head) or (dim_inner, dim_state)
+        dt_limit_kwargs = {} if self.dt_limit == (0., float("inf")) else dict(dt_limit=self.dt_limit)
+        
+        if self.use_mem_eff_path:
+            # Fully fused path
+            out = mamba_split_conv1d_scan_combined(
+                zxbcdt,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.dt_bias,
+                A,
+                D=self.D,
+                chunk_size=self.chunk_size,
+                seq_idx=seq_idx,
+                activation=self.activation,
+                rmsnorm_weight=self.norm.weight if self.rms_norm else None,
+                rmsnorm_eps=self.norm.eps if self.rms_norm else 1.0e-6,
+                outproj_weight=self.out_proj.weight,
+                outproj_bias=self.out_proj.bias,
+                headdim=self.dim_head,
+                ngroups=self.num_group,
+                norm_before_gate=False,
+                **dt_limit_kwargs,
+            )
+            if seqlen_orig is not None:
+                out = rearrange(out, "b l d -> (b l) d")
+        else:
+            dim_mlp = (zxbcdt.shape[-1] - (2*self.dim_ssd + 2*self.num_group*self.dim_state + self.num_head)) // 2
+            z0, x0, z, xBC, dt = torch.split(
+                zxbcdt, [dim_mlp, dim_mlp, self.dim_ssd, self.dim_ssd + 2*self.num_group*self.dim_state, self.num_head], dim=-1
+            )
+            
+            assert self.activaiton in ["silu", "swish"]
+            # NOTE: this code requires the causal_conv1d package
+            xBC = causal_conv1d_fn(
+                x=xBC.transpose(1, 2), # (D, self.dim_ssd + 2 * n_groups * d_state, L)
+                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            ).transpose(1, 2) # (D, L, self.dim_ssd + 2 * n_groups * d_state)
+            
+            # split into 3 main branches: X, B, C (respectively V, K, Q in the SSM/attention duality)
+            x, B, C = torch.split(xBC, [self.dim_ssd, self.num_group*self.dim_state, self.num_group*self.dim_state], dim=-1)
+            y = mamba_chunk_scan_combined(
+                rearrange(x, "b l (h p) -> b l h p", p=self.dim_head),
+                dt,
+                A,
+                rearrange(B, "b l (g n) -> b l g n", g=self.num_group),
+                rearrange(C, "b l (g n) -> b l g n", g=self.num_group),
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=rearrange(z, "b l (h p) -> b l h p", p=self.dim_head) if not self.rms_norm else None,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                **dt_limit_kwargs,
+            )
+            y = rearrange(y, "b l h p -> b l (h p)")
+            
+            if self.rms_norm:
+                y = self.norm(y, z) # multiply "gate" branch and apply extra normalization layer
+            if dim_mlp > 0:
+                y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+            if seqlen_orig is not None:
+                y = rearrange(y, "b l d -> (b l) d")
+            out = self.out_proj(y)
+        return out
+
+
 class Mamba2Simple(nn.Module):
     def __init__(
         self,
@@ -789,7 +959,7 @@ class Mamba2Simple(nn.Module):
         
         # extra normalization layer right before output projection
         assert RMSNormGated is not None
-        self.norm = RMSNormGated(self.d_inner, eps=1.0e-5, norm_before_gate=False, **factory_kwargs)
+        self.norm = RMSNormGated(self.d_ssm, eps=1.0e-5, norm_before_gate=False, **factory_kwargs)
         
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
     
